@@ -9,6 +9,12 @@ import { isKillSwitchOn } from '@/lib/settings';
 import { normalizeSingleSize, normalizeSizeList } from '@/lib/cj/size-normalization';
 import { normalizeCjImageKey } from '@/lib/cj/image-gallery';
 import { enhanceProductImageUrl } from '@/lib/media/image-quality';
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  extractVariantOptionsFromRawVariant,
+} from '@/lib/variants/dynamic-options';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -103,6 +109,7 @@ export async function POST(req: Request) {
       'video_source_quality_hint',
       'media_mode',
       'has_video',
+      'available_options',
       'available_sizes',
       'available_colors',
     ] as const;
@@ -112,6 +119,20 @@ export async function POST(req: Request) {
     );
     for (const result of optionalColumnResults) {
       if (result.exists) optionalColumnSet.add(result.col);
+    }
+
+    const variantOptionalColumns = ['variant_options', 'option_signature'] as const;
+    const variantOptionalColumnSet = new Set<string>();
+    if (hasVariantsTable) {
+      const variantOptionalColumnResults = await Promise.all(
+        variantOptionalColumns.map(async (col) => ({
+          col,
+          exists: await hasColumn('product_variants', col).catch(() => false),
+        }))
+      );
+      for (const result of variantOptionalColumnResults) {
+        if (result.exists) variantOptionalColumnSet.add(result.col);
+      }
     }
 
     for (const cj of items) {
@@ -131,20 +152,12 @@ export async function POST(req: Request) {
         // Calculate totalStock from known values only, but keep ALL variants (even with unknown stock)
         // If ALL variants have unknown stock, product stock should be null (not 0)
         const variants = cj.variants || [];
-        const deduplicatedAvailableSizes = normalizeSizeList(
-          variants.flatMap((v: any) => [v?.size, v?.variantKey]),
-          { allowNumeric: false }
-        );
-        const availableColorMap = new Map<string, string>();
-        for (const v of variants as any[]) {
-          const rawColor = typeof v?.color === 'string' ? v.color.trim() : '';
-          if (!rawColor) continue;
-          const colorKey = rawColor.toLowerCase().replace(/\s+/g, ' ');
-          if (!availableColorMap.has(colorKey)) {
-            availableColorMap.set(colorKey, rawColor);
-          }
-        }
-        const deduplicatedAvailableColors = Array.from(availableColorMap.values());
+        const dynamicAvailableOptions = deriveAvailableOptionsFromVariants(variants, {
+          includeOutOfStockDimensions: false,
+        });
+        const legacy = deriveLegacyOptionArrays(dynamicAvailableOptions);
+        const deduplicatedAvailableSizes = legacy.availableSizes;
+        const deduplicatedAvailableColors = legacy.availableColors;
 
         const variantsWithKnownStock = variants.filter((v) => {
           if (typeof v.stock === 'number' && v.stock >= 0) return true;
@@ -192,6 +205,7 @@ export async function POST(req: Request) {
           video_source_quality_hint: cj.videoSourceQualityHint || null,
           media_mode: mediaMode || null,
           has_video: Boolean(cj.video4kUrl || cj.videoUrl),
+          available_options: dynamicAvailableOptions.length > 0 ? dynamicAvailableOptions : null,
           available_sizes: deduplicatedAvailableSizes.length > 0 ? deduplicatedAvailableSizes : null,
           available_colors: deduplicatedAvailableColors.length > 0 ? deduplicatedAvailableColors : null,
           processing_time_hours: null,
@@ -306,11 +320,22 @@ export async function POST(req: Request) {
                 // Neither is known - cannot import without fabricating data
                 totalStock = null;
               }
+
+              const variantOptions = extractVariantOptionsFromRawVariant(v);
+              if (v.color && !Object.keys(variantOptions).some((name) => /color|colour/i.test(name))) {
+                variantOptions.Color = String(v.color).trim();
+              }
+              if (normalizedSize && !Object.keys(variantOptions).some((name) => /size/i.test(name))) {
+                variantOptions.Size = normalizedSize;
+              }
+              const optionSignature = buildOptionSignature(variantOptions);
               
               return {
                 product_id: productId,
                 option_name: 'Size',
                 option_value: normalizedSize || normalizedVariantKeySize || v.variantKey || '-',
+                variant_options: Object.keys(variantOptions).length > 0 ? variantOptions : null,
+                option_signature: optionSignature || null,
                 cj_sku: v.cjSku || null,
                 cj_variant_id: v.vid || null,
                 variant_key: v.variantKey || null, // Short name like "Black And Silver-2XL"
@@ -328,9 +353,19 @@ export async function POST(req: Request) {
           // Do NOT filter out variants - that would misrepresent CJ's catalog
             
           if (variantsRows.length > 0) {
+            const safeVariantsRows = variantsRows.map((row) => {
+              const next: Record<string, any> = { ...row };
+              for (const col of variantOptionalColumns) {
+                if (!variantOptionalColumnSet.has(col)) {
+                  delete next[col];
+                }
+              }
+              return next;
+            });
+
             const { error: vErr } = await supabase
               .from('product_variants')
-              .insert(variantsRows);
+              .insert(safeVariantsRows);
             if (vErr) throw vErr;
           }
         }

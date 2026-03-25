@@ -1,12 +1,13 @@
 "use client";
 
-import { Star, TrendingUp, Image as ImageIcon, Tag, Ruler, FolderOpen, DollarSign, Info, Palette, Smartphone } from "lucide-react";
+import { Star, TrendingUp, Image as ImageIcon, Tag, Ruler, FolderOpen, DollarSign, Info, Palette } from "lucide-react";
 import SmartImage from "@/components/smart-image";
 import { enhanceProductImageUrl } from "@/lib/media/image-quality";
 import { normalizeDisplayedRating } from "@/lib/rating/engine";
 import { sarToUsd } from "@/lib/pricing";
 import { normalizeSizeList } from "@/lib/import/normalization";
 import type { PricedProduct } from "./types";
+import { deriveAvailableOptionsFromVariants, parseDynamicAvailableOptions } from "@/lib/variants/dynamic-options";
 
 type PreviewPageOneProps = {
   product: PricedProduct;
@@ -69,6 +70,36 @@ export default function PreviewPageOne({ product }: PreviewPageOneProps) {
   const uniqueModels = product.availableModels && product.availableModels.length > 0
     ? product.availableModels
     : [];
+  const dynamicAvailableOptions = (() => {
+    const direct = parseDynamicAvailableOptions((product as any).availableOptions ?? (product as any).available_options);
+    if (direct.length > 0) return direct;
+
+    const variantDerived = deriveAvailableOptionsFromVariants(
+      Array.isArray((product as any).variants) ? ((product as any).variants as any[]) : [],
+      { includeOutOfStockDimensions: false }
+    );
+    if (variantDerived.length > 0) return variantDerived;
+
+    const fallback: Array<{ name: string; values: string[]; inStockValues: string[]; source?: string }> = [];
+    if (uniqueColors.length > 0) {
+      fallback.push({ name: "Color", values: uniqueColors, inStockValues: uniqueColors, source: "legacy" });
+    }
+    if (uniqueModels.length > 0) {
+      fallback.push({ name: "Model", values: uniqueModels, inStockValues: uniqueModels, source: "legacy" });
+    }
+    if (uniqueSizes.length > 0) {
+      fallback.push({ name: "Size", values: uniqueSizes, inStockValues: uniqueSizes, source: "legacy" });
+    }
+    return fallback;
+  })();
+  const visibleDynamicOptions = dynamicAvailableOptions
+    .map((option) => ({
+      ...option,
+      visibleValues: Array.isArray(option.inStockValues)
+        ? option.inStockValues.filter((value) => typeof value === "string" && value.trim().length > 0)
+        : [],
+    }))
+    .filter((option) => option.visibleValues.length > 0);
 
   const imageCount = product.images?.length || 0;
   const previewSku = (() => {
@@ -88,7 +119,7 @@ export default function PreviewPageOne({ product }: PreviewPageOneProps) {
     : 0;
 
   console.log(
-    `[PreviewPageOne] Product ${product.cjSku}: listedNum=${product.listedNum}, displayedRating=${displayedRating}, confidence=${ratingConfidence}, colors=${uniqueColors.length}, sizes=${uniqueSizes.length}, models=${uniqueModels.length}`
+    `[PreviewPageOne] Product ${product.cjSku}: listedNum=${product.listedNum}, displayedRating=${displayedRating}, confidence=${ratingConfidence}, optionDimensions=${visibleDynamicOptions.length}`
   );
 
   return (
@@ -188,77 +219,44 @@ export default function PreviewPageOne({ product }: PreviewPageOneProps) {
           <p className="mt-2 text-xs text-gray-500">Final SKU is guaranteed unique and will be assigned when you add to queue.</p>
         </div>
 
-        {/* Colors */}
-        {uniqueColors.length > 0 && (
-          <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
+        {/* Dynamic options (strict in-stock values only) */}
+        {visibleDynamicOptions.length > 0 && (
+          <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm space-y-5">
+            <div className="flex items-center gap-3">
               <Palette className="h-5 w-5 text-pink-600" />
-              <span className="text-gray-500 font-medium">Available Colors</span>
-              <span className="text-sm text-gray-400">({uniqueColors.length})</span>
+              <span className="text-gray-500 font-medium">Available Options</span>
+              <span className="text-sm text-gray-400">({visibleDynamicOptions.length} dimensions)</span>
             </div>
-            <div className="flex flex-wrap gap-3">
-              {uniqueColors.map((color, idx) => (
-                <span
-                  key={idx}
-                  className="bg-pink-50 text-pink-700 px-4 py-2 rounded-lg font-semibold text-lg border border-pink-200"
-                >
-                  {color}
-                </span>
-              ))}
-            </div>
+
+            {visibleDynamicOptions.map((option) => (
+              <div key={option.name} className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-gray-700">{option.name}:</span>
+                  <span className="text-xs text-gray-400">({option.visibleValues.length})</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {option.visibleValues.map((value, idx) => (
+                    <span
+                      key={`${option.name}-${idx}-${value}`}
+                      className="bg-pink-50 text-pink-700 px-3 py-1.5 rounded-lg font-medium text-sm border border-pink-200"
+                    >
+                      {value}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
-        {/* Compatible Devices/Models */}
-        {uniqueModels.length > 0 && (
-          <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
-              <Smartphone className="h-5 w-5 text-blue-600" />
-              <span className="text-gray-500 font-medium">Compatible Devices</span>
-              <span className="text-sm text-gray-400">({uniqueModels.length})</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {uniqueModels.map((model, idx) => (
-                <span
-                  key={idx}
-                  className="bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-medium text-sm border border-blue-200"
-                >
-                  {model}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Sizes (for clothing/shoes) */}
-        {uniqueSizes.length > 0 && (
-          <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
-              <Ruler className="h-5 w-5 text-purple-600" />
-              <span className="text-gray-500 font-medium">Available Sizes</span>
-              <span className="text-sm text-gray-400">({uniqueSizes.length})</span>
-            </div>
-            <div className="flex flex-wrap gap-3">
-              {uniqueSizes.map((size, idx) => (
-                <span
-                  key={idx}
-                  className="bg-purple-50 text-purple-700 px-4 py-2 rounded-lg font-semibold text-lg border border-purple-200"
-                >
-                  {size}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* No variants message */}
-        {uniqueColors.length === 0 && uniqueModels.length === 0 && uniqueSizes.length === 0 && (
+        {/* No in-stock options message */}
+        {visibleDynamicOptions.length === 0 && (
           <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
             <div className="flex items-center gap-3 mb-3">
               <Ruler className="h-5 w-5 text-purple-600" />
-              <span className="text-gray-500 font-medium">Available Sizes</span>
+              <span className="text-gray-500 font-medium">Available Options</span>
             </div>
-            <p className="text-gray-400 text-lg">One Size</p>
+            <p className="text-gray-400 text-lg">No in-stock options found</p>
           </div>
         )}
 

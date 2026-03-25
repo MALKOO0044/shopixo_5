@@ -15,6 +15,15 @@ import { computeBilledWeightKg, resolveDdpShippingSar } from "@/lib/pricing";
 import { normalizeDisplayedRating } from "@/lib/rating/engine";
 import { normalizeSingleSize, normalizeSizeList as normalizeCjSizeList } from "@/lib/cj/size-normalization";
 import { extractImagesFromHtml, parseProductDescription } from "@/components/product/SafeHtmlRenderer";
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  type DynamicAvailableOption,
+  isVariantInStockStrict,
+  normalizeOptionNameKey,
+  parseDynamicAvailableOptions,
+  parseDynamicVariantOptions,
+} from "@/lib/variants/dynamic-options";
 
 function isLikelyImageUrl(s: string): boolean {
   if (!s) return false;
@@ -123,6 +132,36 @@ function resolveColorImageForColor(colorValue: unknown, colorMap: Record<string,
   }
 
   return null;
+}
+
+function findOptionValueByNormalizedKey(options: Record<string, string>, key: string): string {
+  for (const [name, value] of Object.entries(options || {})) {
+    if (normalizeOptionNameKey(name) === key) {
+      return String(value || '').trim();
+    }
+  }
+  return '';
+}
+
+function selectedOptionsMatchVariantOptions(
+  selected: Record<string, string>,
+  variant: Record<string, string>
+): boolean {
+  const selectedEntries = Object.entries(selected || {}).filter(
+    ([name, value]) => String(name).trim().length > 0 && String(value).trim().length > 0
+  );
+  if (selectedEntries.length === 0) return false;
+
+  for (const [name, value] of selectedEntries) {
+    const key = normalizeOptionNameKey(name);
+    const selectedValue = String(value || '').trim().toLowerCase();
+    const variantValue = findOptionValueByNormalizedKey(variant, key).toLowerCase();
+    if (!variantValue || variantValue !== selectedValue) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function htmlToPlainText(value: unknown): string {
@@ -1054,6 +1093,68 @@ export default function ProductDetailsClient({
   }
 
   const hasRows = Array.isArray(variantRows) && variantRows.length > 0;
+  const dynamicAvailableOptions = useMemo(() => {
+    const direct = parseDynamicAvailableOptions((product as any).available_options ?? (product as any).availableOptions);
+    if (direct.length > 0) return direct;
+
+    if (hasRows) {
+      const fromRows = deriveAvailableOptionsFromVariants(
+        (variantRows || []).map((row) => ({
+          ...row,
+          variantOptions: parseDynamicVariantOptions((row as any).variant_options),
+        })),
+        { includeOutOfStockDimensions: false }
+      );
+      if (fromRows.length > 0) return fromRows;
+    }
+
+    const variantsJson = (product as any).variants;
+    if (Array.isArray(variantsJson) && variantsJson.length > 0) {
+      return deriveAvailableOptionsFromVariants(variantsJson, { includeOutOfStockDimensions: false });
+    }
+
+    return [];
+  }, [product, hasRows, variantRows]);
+
+  const dynamicOptionDimensions = useMemo(() => {
+    return dynamicAvailableOptions
+      .map((option: DynamicAvailableOption) => {
+        const sourceValues = Array.isArray(option.inStockValues) && option.inStockValues.length > 0
+          ? option.inStockValues
+          : (Array.isArray(option.values) ? option.values : []);
+        const dedupe = new Map<string, string>();
+        for (const value of sourceValues) {
+          const clean = String(value || '').trim();
+          if (!clean) continue;
+          const key = clean.toLowerCase();
+          if (!dedupe.has(key)) dedupe.set(key, clean);
+        }
+        return {
+          ...option,
+          valuesForSelector: Array.from(dedupe.values()),
+        };
+      })
+      .filter((option: DynamicAvailableOption & { valuesForSelector: string[] }) => option.valuesForSelector.length > 0);
+  }, [dynamicAvailableOptions]);
+
+  const colorDynamicOption = useMemo(
+    () => dynamicOptionDimensions.find((option: DynamicAvailableOption & { valuesForSelector: string[] }) => /color|colour/.test(normalizeOptionNameKey(option.name))),
+    [dynamicOptionDimensions]
+  );
+
+  const sizeDynamicOption = useMemo(
+    () => dynamicOptionDimensions.find((option: DynamicAvailableOption & { valuesForSelector: string[] }) => /size/.test(normalizeOptionNameKey(option.name))),
+    [dynamicOptionDimensions]
+  );
+
+  const extraDynamicOptions = useMemo(
+    () =>
+      dynamicOptionDimensions.filter((option: DynamicAvailableOption & { valuesForSelector: string[] }) => {
+        const key = normalizeOptionNameKey(option.name);
+        return !/color|colour/.test(key) && !/size/.test(key);
+      }),
+    [dynamicOptionDimensions]
+  );
   
   // Primary: Check variant rows from product_variants table
   const bothDims = useMemo(() => {
@@ -1099,6 +1200,10 @@ export default function ProductDetailsClient({
   // PRIMARY: Get available colors/sizes from product fields (available_colors, available_sizes arrays)
   // These are stored during import and contain ALL colors/sizes from CJ - WITH DEDUPLICATION AND SKU FILTERING
   const productColors = useMemo(() => {
+    if (colorDynamicOption && colorDynamicOption.valuesForSelector.length > 0) {
+      return colorDynamicOption.valuesForSelector;
+    }
+
     // Helper to deduplicate colors by normalized key AND filter out SKU codes
     const deduplicateAndFilterColors = (colors: string[]): string[] => {
       const colorMap = new Map<string, string>();
@@ -1132,9 +1237,13 @@ export default function ProductDetailsClient({
       return variantRowColors;
     }
     return [];
-  }, [product, hasRows, bothDims, variantRowColors]);
+  }, [product, hasRows, bothDims, variantRowColors, colorDynamicOption]);
 
   const productSizes = useMemo(() => {
+    if (sizeDynamicOption && sizeDynamicOption.valuesForSelector.length > 0) {
+      return sizeDynamicOption.valuesForSelector;
+    }
+
     // First try available_sizes array (most complete source from CJ import)
     const as = (product as any).available_sizes;
     if (Array.isArray(as) && as.length > 0) {
@@ -1152,7 +1261,7 @@ export default function ProductDetailsClient({
       return normalizeAndDedupeSizes(variantRowSizes);
     }
     return [];
-  }, [product, hasRows, variantRowSizes]);
+  }, [product, hasRows, variantRowSizes, sizeDynamicOption]);
 
   // Use variant rows as primary, fallback to product-level arrays
   const hasFallbackDims = productColors.length > 0 && productSizes.length > 0;
@@ -1167,9 +1276,6 @@ export default function ProductDetailsClient({
     // The UI will handle this by showing only sizes (no color selector)
     return [];
   }, [productColors, variantRowColors]);
-
-  // Track whether we have meaningful color options or product is "size-only"
-  const isSizeOnlyProduct = colorOptions.length === 0 && productSizes.length > 0;
 
   // CJ PRODUCTS: ALL sizes are available for ALL colors
   // We use the UNION of all sizes across the entire product for every color
@@ -1265,11 +1371,18 @@ export default function ProductDetailsClient({
   }, [hasRows, bothDims, variantRowSizes, productSizes, productColors]);
 
   const singleDimName = useMemo(() => {
+    if (sizeDynamicOption?.name) return sizeDynamicOption.name;
     if (!hasRows || bothDims) return 'Size';
     return variantRows![0]?.option_name || 'Size';
-  }, [hasRows, bothDims, variantRows]);
+  }, [hasRows, bothDims, variantRows, sizeDynamicOption]);
 
   const twoDimNames = useMemo(() => {
+    if (colorDynamicOption?.name || sizeDynamicOption?.name) {
+      return {
+        color: colorDynamicOption?.name || 'Color',
+        size: sizeDynamicOption?.name || 'Size',
+      };
+    }
     if (!hasRows || !bothDims) return { color: 'Color', size: 'Size' };
     const first = variantRows![0];
     const optName = first?.option_name || '';
@@ -1282,10 +1395,11 @@ export default function ProductDetailsClient({
       return { color: parts[0] || 'Color', size: parts[1] || 'Size' };
     }
     return { color: 'Color', size: 'Size' };
-  }, [hasRows, bothDims, variantRows]);
+  }, [hasRows, bothDims, variantRows, colorDynamicOption, sizeDynamicOption]);
 
   const [selectedColor, setSelectedColor] = useState('');
   const [selectedSize, setSelectedSize] = useState('');
+  const [selectedExtraOptions, setSelectedExtraOptions] = useState<Record<string, string>>({});
   
   // Initialize color and size once data is available
   useEffect(() => {
@@ -1293,6 +1407,42 @@ export default function ProductDetailsClient({
       setSelectedColor(colorOptions[0]);
     }
   }, [colorOptions, selectedColor]);
+
+  useEffect(() => {
+    setSelectedExtraOptions((prev: Record<string, string>) => {
+      if (extraDynamicOptions.length === 0) {
+        return Object.keys(prev).length > 0 ? {} : prev;
+      }
+
+      const next: Record<string, string> = {};
+      let changed = false;
+
+      for (const option of extraDynamicOptions) {
+        const allowed = option.valuesForSelector;
+        const prevValue = String(prev[option.name] || '').trim();
+        if (prevValue && allowed.some((value: string) => value.toLowerCase() === prevValue.toLowerCase())) {
+          next[option.name] = allowed.find((value: string) => value.toLowerCase() === prevValue.toLowerCase()) || prevValue;
+        } else if (allowed.length > 0) {
+          next[option.name] = allowed[0];
+          if (prevValue !== next[option.name]) changed = true;
+        }
+      }
+
+      for (const key of Object.keys(prev)) {
+        if (!(key in next)) {
+          changed = true;
+        }
+      }
+
+      for (const [key, value] of Object.entries(next)) {
+        if (prev[key] !== value) {
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [extraDynamicOptions]);
   
   useEffect(() => {
     if (effectiveBothDims && selectedColor) {
@@ -1312,14 +1462,67 @@ export default function ProductDetailsClient({
     if (effectiveBothDims) {
       if (selectedColor) opts[twoDimNames.color] = selectedColor;
       if (selectedSize) opts[twoDimNames.size] = selectedSize;
-    } else if (singleDimOptions.length > 0) {
-      opts[singleDimName] = selectedSize;
+    } else {
+      if (colorOptions.length > 0 && selectedColor) {
+        opts[twoDimNames.color] = selectedColor;
+      }
+      if (singleDimOptions.length > 0 && selectedSize) {
+        opts[singleDimName] = selectedSize;
+      }
     }
+
+    for (const option of extraDynamicOptions) {
+      const selectedValue = String(selectedExtraOptions[option.name] || '').trim();
+      if (selectedValue) {
+        opts[option.name] = selectedValue;
+      }
+    }
+
     return opts;
-  }, [effectiveBothDims, selectedColor, selectedSize, singleDimOptions.length, singleDimName, twoDimNames]);
+  }, [
+    effectiveBothDims,
+    selectedColor,
+    selectedSize,
+    colorOptions.length,
+    singleDimOptions.length,
+    singleDimName,
+    twoDimNames,
+    extraDynamicOptions,
+    selectedExtraOptions,
+  ]);
+
+  const selectedOptionsExcludingSize = useMemo(() => {
+    const next: Record<string, string> = {};
+    for (const [name, value] of Object.entries(selectedOptions)) {
+      if (normalizeOptionNameKey(name) === 'size') continue;
+      const clean = String(value || '').trim();
+      if (!clean) continue;
+      next[name] = clean;
+    }
+    return next;
+  }, [selectedOptions]);
 
   const selectedVariant = useMemo(() => {
     if (!variantRows || variantRows.length === 0) return null;
+
+    const selectedSignature = buildOptionSignature(selectedOptions);
+    if (selectedSignature) {
+      const bySignature = variantRows.find((variant) => {
+        const signature = String((variant as any).option_signature || '').trim();
+        return signature.length > 0 && signature === selectedSignature;
+      });
+      if (bySignature) return bySignature;
+
+      const byVariantOptions = variantRows.find((variant) => {
+        const optionMap = parseDynamicVariantOptions((variant as any).variant_options);
+        if (Object.keys(optionMap).length === 0) return false;
+        if (selectedOptionsMatchVariantOptions(selectedOptions, optionMap)) return true;
+        const signature = buildOptionSignature(optionMap);
+        return signature.length > 0 && signature === selectedSignature;
+      });
+      if (byVariantOptions) return byVariantOptions;
+    }
+
     if (bothDims) {
       if (!selectedColor || !selectedSize) return null;
       const normalizedSelectedColor = selectedColor.toLowerCase().trim();
@@ -1328,13 +1531,24 @@ export default function ProductDetailsClient({
         return String(cs.color || '').toLowerCase().trim() === normalizedSelectedColor && cs.size === selectedSize;
       }) || null;
     }
+
+    if (!selectedSize && selectedColor) {
+      const normalizedSelectedColor = selectedColor.toLowerCase().trim();
+      const legacyColorMatch = variantRows.find((variant) => {
+        const optionNameKey = normalizeOptionNameKey((variant as any).option_name || '');
+        if (!/color|colour/.test(optionNameKey)) return false;
+        return String((variant as any).option_value || '').toLowerCase().trim() === normalizedSelectedColor;
+      });
+      if (legacyColorMatch) return legacyColorMatch;
+    }
+
     if (!selectedSize) return null;
     return variantRows.find((v) => {
       const normalizedOptionSize =
         normalizeSingleSize(v.option_value, { allowNumeric: true }) || String(v.option_value || '').trim();
       return normalizedOptionSize === selectedSize;
     }) || null;
-  }, [variantRows, selectedColor, selectedSize, bothDims]);
+  }, [variantRows, selectedColor, selectedSize, bothDims, selectedOptions]);
 
   // sizeStockMap: Maps size -> stock value
   // CRITICAL: undefined/null stock means UNKNOWN (treat as available), NOT out of stock
@@ -1344,6 +1558,29 @@ export default function ProductDetailsClient({
     
     // Primary: Use variantRows from product_variants table
     if (hasRows) {
+      if (sizeDynamicOption?.valuesForSelector?.length) {
+        for (const r of variantRows || []) {
+          const optionMap = parseDynamicVariantOptions((r as any).variant_options);
+          if (Object.keys(optionMap).length === 0) continue;
+
+          const sizeValue = findOptionValueByNormalizedKey(optionMap, 'size');
+          if (!sizeValue) continue;
+
+          if (
+            Object.keys(selectedOptionsExcludingSize).length > 0 &&
+            !selectedOptionsMatchVariantOptions(selectedOptionsExcludingSize, optionMap)
+          ) {
+            continue;
+          }
+
+          map[sizeValue] = r.stock ?? undefined;
+        }
+
+        if (Object.keys(map).length > 0) {
+          return map;
+        }
+      }
+
       if (bothDims && selectedColor) {
         for (const r of variantRows!) {
           const cs = splitColorSize(r.option_value || '');
@@ -1391,7 +1628,16 @@ export default function ProductDetailsClient({
     
     // Last fallback: Empty map - sizes will be treated as available (unknown stock)
     return map;
-  }, [hasRows, variantRows, bothDims, effectiveBothDims, selectedColor, product]);
+  }, [
+    hasRows,
+    variantRows,
+    bothDims,
+    effectiveBothDims,
+    selectedColor,
+    product,
+    sizeDynamicOption,
+    selectedOptionsExcludingSize,
+  ]);
 
   const colorImageMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -1498,9 +1744,67 @@ export default function ProductDetailsClient({
     return alignedMap;
   }, [colorOptions, product.images, product, hasRows, variantRows]);
 
-  const currentSizes = effectiveBothDims 
-    ? (sizeOptionsByColor[selectedColor] || [])
-    : singleDimOptions;
+  const currentSizes = useMemo(() => {
+    if (sizeDynamicOption?.valuesForSelector?.length) {
+      const baseSizes = sizeDynamicOption.valuesForSelector;
+
+      if (hasRows && Array.isArray(variantRows) && variantRows.length > 0) {
+        const dedupe = new Map<string, string>();
+
+        for (const row of variantRows) {
+          const optionMap = parseDynamicVariantOptions((row as any).variant_options);
+          if (Object.keys(optionMap).length === 0) continue;
+
+          const sizeValue = findOptionValueByNormalizedKey(optionMap, 'size');
+          if (!sizeValue) continue;
+
+          if (
+            Object.keys(selectedOptionsExcludingSize).length > 0 &&
+            !selectedOptionsMatchVariantOptions(selectedOptionsExcludingSize, optionMap)
+          ) {
+            continue;
+          }
+
+          if (!isVariantInStockStrict(row as any)) {
+            continue;
+          }
+
+          const key = sizeValue.toLowerCase();
+          if (!dedupe.has(key)) dedupe.set(key, sizeValue);
+        }
+
+        const filteredSizes = Array.from(dedupe.values());
+        if (filteredSizes.length > 0) {
+          return filteredSizes;
+        }
+      }
+
+      return baseSizes;
+    }
+
+    return effectiveBothDims
+      ? (sizeOptionsByColor[selectedColor] || [])
+      : singleDimOptions;
+  }, [
+    sizeDynamicOption,
+    hasRows,
+    variantRows,
+    selectedOptionsExcludingSize,
+    effectiveBothDims,
+    sizeOptionsByColor,
+    selectedColor,
+    singleDimOptions,
+  ]);
+
+  useEffect(() => {
+    if (currentSizes.length === 0) {
+      if (selectedSize) setSelectedSize('');
+      return;
+    }
+    if (!selectedSize || !currentSizes.includes(selectedSize)) {
+      setSelectedSize(currentSizes[0] || '');
+    }
+  }, [currentSizes, selectedSize]);
 
   const cjPid = (product as any)?.cj_product_id as string | undefined;
   const [quote, setQuote] = useState<{ retailSar: number; shippingSar: number; options: any[] } | null>(null);
@@ -1552,19 +1856,21 @@ export default function ProductDetailsClient({
       return v.stock > 0;
     });
   
-  const hasOptionsAvailable = colorOptions.length > 0 || currentSizes.length > 0;
+  const hasOptionsAvailable =
+    colorOptions.length > 0 ||
+    currentSizes.length > 0 ||
+    extraDynamicOptions.some((option: DynamicAvailableOption & { valuesForSelector: string[] }) => option.valuesForSelector.length > 0);
   
   // Out of stock only if no stock from any source
   const isOutOfStock = !hasProductStock && !hasVariantStock && !hasFallbackVariantStock && !hasOptionsAvailable;
   
-  // Variant out of stock only when stock is EXPLICITLY 0 (not null/undefined)
-  const variantOutOfStock = selectedVariant && 
-    selectedVariant.stock !== null && 
-    selectedVariant.stock !== undefined && 
-    selectedVariant.stock <= 0;
-  
-  // Disable add to cart if: out of stock, OR has size options but none selected
-  const addToCartDisabled = isOutOfStock || (currentSizes.length > 0 && !selectedSize);
+  const hasUnselectedExtraOption = extraDynamicOptions.some((option: DynamicAvailableOption & { valuesForSelector: string[] }) => {
+    const value = String(selectedExtraOptions[option.name] || '').trim();
+    return option.valuesForSelector.length > 0 && !value;
+  });
+
+  // Disable add to cart if: out of stock, or required selectors are incomplete
+  const addToCartDisabled = isOutOfStock || (currentSizes.length > 0 && !selectedSize) || hasUnselectedExtraOption;
 
   // Use min_price as default when no variant selected, fallback to product.price
   const minPrice = (product as any).min_price ?? product.price;
@@ -1613,7 +1919,7 @@ export default function ProductDetailsClient({
             showRange={hasVariantPricing && !selectedVariant}
           />
 
-          {effectiveBothDims && colorOptions.length > 0 && (
+          {colorOptions.length > 0 && (
             <ColorSelector
               colors={colorOptions}
               selectedColor={selectedColor}
@@ -1623,17 +1929,56 @@ export default function ProductDetailsClient({
             />
           )}
 
+          {extraDynamicOptions.map((option: DynamicAvailableOption & { valuesForSelector: string[] }) => {
+            const selectedValue = String(selectedExtraOptions[option.name] || '').trim();
+            const values = option.valuesForSelector;
+            if (!Array.isArray(values) || values.length === 0) return null;
+
+            return (
+              <div key={option.name} className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-foreground">{option.name}:</span>
+                  <span className="text-sm text-muted-foreground">{selectedValue}</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {values.map((value) => {
+                    const isSelected = String(value).toLowerCase() === selectedValue.toLowerCase();
+                    return (
+                      <button
+                        key={`${option.name}-${value}`}
+                        onClick={() =>
+                          setSelectedExtraOptions((prev: Record<string, string>) => ({
+                            ...prev,
+                            [option.name]: value,
+                          }))
+                        }
+                        className={cn(
+                          "relative min-w-[48px] px-4 py-2 rounded-md text-sm font-medium transition-all",
+                          isSelected
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-card border border-border hover:border-primary text-foreground"
+                        )}
+                      >
+                        {value}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+
           {currentSizes.length > 0 && (
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-foreground">Size:</span>
+                  <span className="text-sm font-medium text-foreground">{twoDimNames.size}:</span>
                   <span className="text-sm text-muted-foreground">{selectedSize}</span>
                 </div>
                 <SizeGuideModal />
               </div>
               <div className="flex flex-wrap gap-2">
-                {currentSizes.map((size) => {
+                {currentSizes.map((size: string) => {
                   const isSelected = size === selectedSize;
                   // Treat stock=0, null, undefined as "available" (CJ often returns 0 as default)
                   const stockValue = sizeStockMap[size];

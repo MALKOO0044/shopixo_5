@@ -12,6 +12,12 @@ import { extractCjProductGalleryImages, normalizeCjImageKey, prioritizeCjHeroIma
 import { extractCjProductVideoUrl } from '@/lib/cj/video';
 import { normalizeSingleSize, normalizeSizeList } from '@/lib/cj/size-normalization';
 import { build4kVideoDelivery } from '@/lib/video/delivery';
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  extractVariantOptionsFromRawVariant,
+} from '@/lib/variants/dynamic-options';
 
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -578,6 +584,16 @@ export async function GET(
     // --- Fetch variants ---
     const variants = await getProductVariants(pid);
     console.log(`[ProductDetails] Fetched ${variants.length} variants`);
+    const variantOptionsByVariantId = new Map<string, { options: Record<string, string> }>();
+
+    for (const variant of variants) {
+      const variantId = String(variant?.vid || variant?.variantId || variant?.id || '').trim();
+      if (!variantId) continue;
+      const options = extractVariantOptionsFromRawVariant(variant);
+      variantOptionsByVariantId.set(variantId, {
+        options,
+      });
+    }
 
     // Build set of images from variants (purchasable options) + structured color map.
     const variantImages: string[] = [];
@@ -848,6 +864,17 @@ export async function GET(
         variantKey: variant.variantKey,
         variantName: variantName,
       });
+      const resolvedVariantOptions = (() => {
+        const base = variantOptionsByVariantId.get(variantId)?.options || extractVariantOptionsFromRawVariant(variant);
+        if (color && !Object.keys(base).some((name) => /color|colour/i.test(name))) {
+          base.Color = color;
+        }
+        if (size && !Object.keys(base).some((name) => /size/i.test(name))) {
+          base.Size = size;
+        }
+        return base;
+      })();
+      const optionSignature = buildOptionSignature(resolvedVariantOptions);
 
       if (shippingAvailable) {
         const totalCostSAR = costSAR + shippingPriceSAR;
@@ -880,6 +907,8 @@ export async function GET(
           variantImage,
           size,
           color,
+          variantOptions: Object.keys(resolvedVariantOptions).length > 0 ? resolvedVariantOptions : undefined,
+          optionSignature: optionSignature || undefined,
           stock: variantStock?.totalStock,
           cjStock: variantStock?.cjStock,
           factoryStock: variantStock?.factoryStock,
@@ -906,6 +935,8 @@ export async function GET(
           variantImage,
           size,
           color,
+          variantOptions: Object.keys(resolvedVariantOptions).length > 0 ? resolvedVariantOptions : undefined,
+          optionSignature: optionSignature || undefined,
           stock: variantStock?.totalStock,
           cjStock: variantStock?.cjStock,
           factoryStock: variantStock?.factoryStock,
@@ -946,6 +977,32 @@ export async function GET(
     
     const originCountry = String(source.originCountry || source.countryOrigin || '').trim() || undefined;
     const hsCode = source.entryCode ? `${source.entryCode}${source.entryNameEn ? ` (${source.entryNameEn})` : ''}` : undefined;
+    const availableOptions = deriveAvailableOptionsFromVariants(
+      variants.map((variant: any) => {
+        const variantId = String(variant?.vid || variant?.variantId || variant?.id || '').trim();
+        const base = variantOptionsByVariantId.get(variantId)?.options ?? extractVariantOptionsFromRawVariant(variant);
+        const variantName = String(variant?.variantNameEn || variant?.variantName || '').replace(/[\u4e00-\u9fff]/g, '').trim() || undefined;
+        const variantSku = String(variant?.variantSku || variant?.sku || variantId || '');
+        const variantStock = getVariantStock({
+          vid: variantId,
+          sku: variantSku,
+          variantKey: variant?.variantKey,
+          variantName,
+        });
+        return {
+          variantOptions: base,
+          stock: variantStock?.totalStock ?? variant?.stock,
+          totalStock: variantStock?.totalStock,
+          cjStock: variantStock?.cjStock,
+          factoryStock: variantStock?.factoryStock,
+        };
+      }),
+      { includeOutOfStockDimensions: false }
+    );
+    const legacyFromDynamicOptions = deriveLegacyOptionArrays(availableOptions);
+    const resolvedAvailableColors = legacyFromDynamicOptions.availableColors;
+    const resolvedAvailableSizes = legacyFromDynamicOptions.availableSizes;
+    const resolvedAvailableModels = legacyFromDynamicOptions.availableModels;
     const sourceVideoUrl = extractCjProductVideoUrl(source);
     const videoDelivery = build4kVideoDelivery(sourceVideoUrl);
     const hasDeliverableVideo =
@@ -1075,9 +1132,10 @@ export async function GET(
       videoDeliveryMode: videoDelivery.mode,
       videoQualityGatePassed: videoDelivery.qualityGatePassed,
       videoSourceQualityHint: videoDelivery.sourceQualityHint,
-      availableSizes: extractedSizes.length > 0 ? extractedSizes : undefined,
-      availableColors: extractedColors.length > 0 ? extractedColors : undefined,
-      availableModels: extractedModels.length > 0 ? extractedModels : undefined,
+      availableOptions: availableOptions.length > 0 ? availableOptions : undefined,
+      availableSizes: resolvedAvailableSizes.length > 0 ? resolvedAvailableSizes : undefined,
+      availableColors: resolvedAvailableColors.length > 0 ? resolvedAvailableColors : undefined,
+      availableModels: resolvedAvailableModels.length > 0 ? resolvedAvailableModels : undefined,
       colorImageMap: Object.keys(colorImageMap).length > 0 ? colorImageMap : undefined,
     };
 

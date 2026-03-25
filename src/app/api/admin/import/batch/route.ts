@@ -12,6 +12,7 @@ import {
 import { extractCjProductVideoUrl, normalizeCjVideoUrl } from "@/lib/cj/video";
 import { build4kVideoDelivery, requiresVideoForMediaMode } from "@/lib/video/delivery";
 import { normalizeSizeList } from "@/lib/cj/size-normalization";
+import { ensureHydrated } from "@/lib/hydration/service";
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -55,23 +56,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "No products provided" }, { status: 400 });
     }
 
-    const missingRequired: string[] = [];
-    for (const p of products) {
-      if (!p?.pid && !p?.cjProductId && !p?.productId) missingRequired.push(`pid`);
-      if (!p?.name) missingRequired.push(`name`);
-      if (!Array.isArray(p?.variants) || p.variants.length === 0) {
-        missingRequired.push(`variants`);
-      } else {
-        for (const v of p.variants) {
-          if (!v?.variantSku) missingRequired.push(`variantSku`);
-          if (v?.sellPriceSAR == null) missingRequired.push(`sellPriceSAR`);
-        }
-      }
-      if (missingRequired.length > 0) break;
-    }
-    if (missingRequired.length > 0) {
-      return NextResponse.json({ ok: false, error: `Missing required fields: ${missingRequired.join(', ')}` }, { status: 400 });
-    }
+    // Hydration gating happens per-product below, so we remove early validation here.
 
     const batch = await createImportBatch({
       name: name || `Import ${new Date().toISOString()}`,
@@ -93,18 +78,101 @@ export async function POST(req: NextRequest) {
     const failedProducts: string[] = [];
     const errorMessages: string[] = [];
     
-    for (const p of products) {
+    for (const input of products) {
+      // Resolve product ID from incoming payload
+      const productId = input.cjProductId || input.pid || input.productId;
+      if (!productId) {
+        failedCount++;
+        failedProducts.push(String(productId));
+        if (errorMessages.length < 3) errorMessages.push("Missing required field: pid");
+        continue;
+      }
+
+      // Ensure full hydration on the server to guarantee fidelity parity
+      let p: any = input;
+      try {
+        const hydrated = await ensureHydrated(String(productId), { dispersionThreshold: 20 });
+        p = {
+          ...input,
+          pid: productId,
+          cjProductId: productId,
+          cjSku: hydrated.cjSku || input.cjSku,
+          name: hydrated.name || input.name,
+          images: Array.isArray(hydrated.images) && hydrated.images.length > 0 ? hydrated.images : input.images,
+          variants: Array.isArray(hydrated.variants) && hydrated.variants.length > 0 ? hydrated.variants : (input.variants || []),
+          avgPriceSAR: hydrated.avgPriceSAR ?? input.avgPriceSAR,
+          stock: typeof hydrated.stock === 'number' ? hydrated.stock : input.stock,
+          displayedRating: hydrated.displayedRating ?? input.displayedRating,
+          ratingConfidence: hydrated.ratingConfidence ?? input.ratingConfidence,
+          reviewCount: hydrated.reviewCount ?? input.reviewCount,
+          categoryName: hydrated.categoryName ?? input.categoryName,
+          availableSizes: hydrated.availableSizes ?? input.availableSizes,
+          availableColors: hydrated.availableColors ?? input.availableColors,
+          availableModels: hydrated.availableModels ?? input.availableModels,
+          description: hydrated.description ?? input.description,
+          overview: hydrated.overview ?? input.overview,
+          productInfo: hydrated.productInfo ?? input.productInfo,
+          sizeInfo: hydrated.sizeInfo ?? input.sizeInfo,
+          productNote: hydrated.productNote ?? input.productNote,
+          packingList: hydrated.packingList ?? input.packingList,
+          videoUrl: hydrated.videoUrl ?? input.videoUrl,
+          videoSourceUrl: hydrated.videoSourceUrl ?? input.videoSourceUrl,
+          video4kUrl: hydrated.video4kUrl ?? input.video4kUrl,
+          videoDeliveryMode: hydrated.videoDeliveryMode ?? input.videoDeliveryMode,
+          videoQualityGatePassed: hydrated.videoQualityGatePassed ?? input.videoQualityGatePassed,
+          videoSourceQualityHint: hydrated.videoSourceQualityHint ?? input.videoSourceQualityHint,
+          inventory: hydrated.inventory ?? input.inventory,
+          inventoryByWarehouse: input.inventoryByWarehouse || hydrated.inventory,
+          inventoryStatus: hydrated.inventoryStatus ?? input.inventoryStatus,
+          inventoryErrorMessage: hydrated.inventoryErrorMessage ?? input.inventoryErrorMessage,
+          colorImageMap: hydrated.colorImageMap ?? input.colorImageMap,
+          productWeight: hydrated.productWeight ?? input.productWeight,
+          packLength: hydrated.packLength ?? input.packLength,
+          packWidth: hydrated.packWidth ?? input.packWidth,
+          packHeight: hydrated.packHeight ?? input.packHeight,
+          originCountry: hydrated.originCountry ?? input.originCountry,
+          hsCode: hydrated.hsCode ?? input.hsCode,
+          profitMargin: hydrated.profitMarginApplied ?? input.profitMargin,
+        };
+      } catch (e: any) {
+        failedCount++;
+        failedProducts.push(String(productId));
+        if (errorMessages.length < 3) errorMessages.push(`Hydration failed for ${productId}: ${e?.message || 'unknown error'}`);
+        continue;
+      }
+
+      // Post-hydration validation for required fields
+      if (!p?.name) {
+        failedCount++;
+        failedProducts.push(String(productId));
+        if (errorMessages.length < 3) errorMessages.push(`Missing required field: name for ${productId}`);
+        continue;
+      }
+      if (!Array.isArray(p?.variants) || p.variants.length === 0) {
+        failedCount++;
+        failedProducts.push(String(productId));
+        if (errorMessages.length < 3) errorMessages.push(`Missing required field: variants for ${productId}`);
+        continue;
+      }
+      for (const v of p.variants) {
+        if (!v?.variantSku || v?.sellPriceSAR == null) {
+          failedCount++;
+          failedProducts.push(String(productId));
+          if (errorMessages.length < 3) errorMessages.push(`Invalid variant data for ${productId}`);
+          p = null; break;
+        }
+      }
+      if (!p) continue;
+
       let avgPrice = p.avgPriceSAR || 0;
       if (!avgPrice && p.variants?.length > 0) {
-        avgPrice = p.variants.reduce((sum: number, v: any) => sum + (v.price || v.variantSellPrice || 0), 0) / p.variants.length;
+        avgPrice = p.variants.reduce((sum: number, v: any) => sum + (v.price || v.variantSellPrice || v.sellPriceUSD || 0), 0) / p.variants.length;
       }
 
       let totalStock = p.stock || 0;
       if (!totalStock && p.variants?.length > 0) {
         totalStock = p.variants.reduce((sum: number, v: any) => sum + (v.stock || v.variantQuantity || 0), 0);
       }
-
-      const productId = p.cjProductId || p.pid || p.productId;
       
       // Handle images - could be array or single image
       let images: string[] = [];

@@ -9,6 +9,14 @@ import { normalizeCjImageKey } from "@/lib/cj/image-gallery";
 import { normalizeSingleSize, normalizeSizeList } from "@/lib/cj/size-normalization";
 import { requiresVideoForMediaMode } from "@/lib/video/delivery";
 import { enhanceProductImageUrl } from "@/lib/media/image-quality";
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  extractVariantOptionsFromRawVariant,
+  parseDynamicAvailableOptions,
+  parseDynamicVariantOptions,
+} from "@/lib/variants/dynamic-options";
 
 // Helper to find category by name/slug/CJ-link and link product to category hierarchy
 async function linkProductToCategory(admin: any, productId: number, categoryName: string, cjCategoryId?: string, supabaseCategoryId?: number): Promise<boolean> {
@@ -490,6 +498,12 @@ function parseColorImageMap(value: unknown): Record<string, string> {
   return normalized;
 }
 
+function resolveQueueAvailableOptions(queueRow: Record<string, any>, variants: any[]): Array<{ name: string; values: string[]; inStockValues: string[]; source?: string }> {
+  const direct = parseDynamicAvailableOptions(queueRow.available_options);
+  if (direct.length > 0) return direct;
+  return deriveAvailableOptionsFromVariants(variants, { includeOutOfStockDimensions: false });
+}
+
 function toPositiveNumberOrNull(value: unknown): number | null {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
@@ -538,6 +552,7 @@ const FIDELITY_PARITY_FIELDS = [
   'size_info',
   'product_note',
   'packing_list',
+  'available_options',
   'supplier_rating',
   'review_count',
   'available_colors',
@@ -624,6 +639,7 @@ export async function POST(req: NextRequest) {
       'size_info',
       'product_note',
       'packing_list',
+      'available_options',
       'video_url',
       'video_source_url',
       'video_4k_url',
@@ -682,6 +698,7 @@ export async function POST(req: NextRequest) {
       'size_info',
       'product_note',
       'packing_list',
+      'available_options',
       'video_url',
       'video_source_url',
       'video_4k_url',
@@ -860,6 +877,26 @@ export async function POST(req: NextRequest) {
             const resolvedSize = normalizeImportVariantSize(v.size ?? matchingPricing?.size ?? null);
             const rawResolvedColor = v.color ?? matchingPricing?.color ?? null;
             const resolvedColor = typeof rawResolvedColor === 'string' ? rawResolvedColor.trim() || null : null;
+            const resolvedVariantOptions = (() => {
+              const fromSource = parseDynamicVariantOptions(
+                v.variant_options ??
+                v.variantOptions ??
+                matchingPricing?.variant_options ??
+                matchingPricing?.variantOptions ??
+                null
+              );
+              if (Object.keys(fromSource).length > 0) return fromSource;
+
+              const extracted = extractVariantOptionsFromRawVariant(v);
+              if (resolvedColor && !Object.keys(extracted).some((name) => /color|colour/i.test(name))) {
+                extracted.Color = resolvedColor;
+              }
+              if (resolvedSize && !Object.keys(extracted).some((name) => /size/i.test(name))) {
+                extracted.Size = resolvedSize;
+              }
+              return extracted;
+            })();
+            const optionSignature = buildOptionSignature(resolvedVariantOptions);
             const resolvedRetailSar = toPositiveNumberOrNull(
               matchingPricing?.price ?? matchingPricing?.sellPriceSAR ?? matchingPricing?.sellPriceSar
             )
@@ -898,12 +935,26 @@ export async function POST(req: NextRequest) {
               cj_stock: v.cjStock ?? matchingPricing?.cjStock ?? null,
               factory_stock: v.factoryStock ?? matchingPricing?.factoryStock ?? null,
               weight_g: v.weight ?? v.weightGrams ?? null,
+              variant_options: Object.keys(resolvedVariantOptions).length > 0 ? resolvedVariantOptions : null,
+              option_signature: optionSignature || null,
               image_url: typeof variantImageSource === 'string' && variantImageSource.trim()
                 ? enhanceProductImageUrl(variantImageSource.trim(), 'gallery')
                 : null,
             };
           })
           .filter((variant): variant is NonNullable<typeof variant> => Boolean(variant));
+
+        const availableOptions = resolveQueueAvailableOptions(qp as any, variants);
+        const legacyFromDynamicOptions = deriveLegacyOptionArrays(availableOptions);
+        const resolvedAvailableColors = Array.isArray(availableColors) && availableColors.length > 0
+          ? availableColors
+          : (legacyFromDynamicOptions.availableColors.length > 0 ? legacyFromDynamicOptions.availableColors : null);
+        const resolvedAvailableSizes = Array.isArray(availableSizes) && availableSizes.length > 0
+          ? availableSizes
+          : (legacyFromDynamicOptions.availableSizes.length > 0 ? legacyFromDynamicOptions.availableSizes : null);
+        const resolvedAvailableModels = legacyFromDynamicOptions.availableModels.length > 0
+          ? legacyFromDynamicOptions.availableModels
+          : (Array.isArray(qp.available_models) ? qp.available_models : null);
 
         if (hasCanonicalVariantPricing && variants.length === 0) {
           throw new Error('Unable to resolve positive SAR prices from queue variant_pricing');
@@ -1035,8 +1086,9 @@ export async function POST(req: NextRequest) {
           origin_country_code: qp.origin_country || null,
           hs_code: qp.hs_code || null,
           size_chart_images: qp.size_chart_images || null,
-          available_sizes: availableSizes,
-          available_colors: availableColors,
+          available_options: availableOptions.length > 0 ? availableOptions : null,
+          available_sizes: resolvedAvailableSizes,
+          available_colors: resolvedAvailableColors,
           color_image_map: Object.keys(alignedColorImageMap).length > 0 ? alignedColorImageMap : null,
           has_variants: variants.length > 0,
           min_price: resolvedMinPrice,
@@ -1050,7 +1102,7 @@ export async function POST(req: NextRequest) {
           rating_confidence: importedRatingConfidence,
           inventory_status: qp.inventory_status ?? null,
           inventory_error_message: qp.inventory_error_message ?? null,
-          available_models: qp.available_models ?? null,
+          available_models: resolvedAvailableModels,
         };
 
         await omitMissingColumns(optionalFields, [
@@ -1060,6 +1112,7 @@ export async function POST(req: NextRequest) {
           'supplier_sku', 'variants', 'weight_g', 'weight_grams', 'pack_length', 'pack_width', 
           'pack_height', 'material', 'product_type', 'origin_country', 'origin_country_code', 'hs_code',
           'size_chart_images', 'available_sizes', 'available_colors', 'has_variants',
+          'available_options',
           'min_price', 'max_price', 'specifications', 'selling_points',
           'cj_category_id', 'supplier_rating', 'review_count', 'displayed_rating', 'rating_confidence', 'overview', 'product_info', 'size_info',
           'product_note', 'packing_list', 'store_sku', 'inventory_status', 'inventory_error_message',
@@ -1106,8 +1159,9 @@ export async function POST(req: NextRequest) {
           packing_list: qp.packing_list ?? null,
           supplier_rating: queueSupplierRating,
           review_count: queueReviewCount,
-          available_colors: availableColors,
-          available_sizes: availableSizes,
+          available_options: availableOptions.length > 0 ? availableOptions : null,
+          available_colors: resolvedAvailableColors,
+          available_sizes: resolvedAvailableSizes,
           color_image_map: Object.keys(alignedColorImageMap).length > 0 ? alignedColorImageMap : null,
         };
 
@@ -1139,31 +1193,26 @@ export async function POST(req: NextRequest) {
         }
 
         if (hasVariantsTable && variants.length > 0) {
-          // Create proper variant rows with Color/Size format
+          // Create proper variant rows with dynamic options and legacy compatibility values.
           const variantRows = variants.map((v: any) => {
-            const normalizedColor = typeof v.color === 'string' ? v.color.trim() : '';
-            const normalizedSize = normalizeImportVariantSize(v.size) || '';
-            const hasColor = normalizedColor.length > 0;
-            const hasSize = normalizedSize.length > 0;
-            
-            let optionName = 'Default';
-            let optionValue = 'Default';
-            
-            if (hasColor && hasSize) {
-              optionName = 'Color / Size';
-              optionValue = `${normalizedColor} / ${normalizedSize}`;
-            } else if (hasColor) {
-              optionName = 'Color';
-              optionValue = normalizedColor;
-            } else if (hasSize) {
-              optionName = 'Size';
-              optionValue = normalizedSize;
-            }
+            const parsedVariantOptions = parseDynamicVariantOptions(v.variant_options);
+            const variantOptions = Object.keys(parsedVariantOptions).length > 0
+              ? parsedVariantOptions
+              : extractVariantOptionsFromRawVariant(v);
+
+            const optionNames = Object.keys(variantOptions);
+            const optionName = optionNames.length > 0 ? optionNames.join(' / ') : 'Default';
+            const optionValue = optionNames.length > 0
+              ? optionNames.map((name) => variantOptions[name]).join(' / ')
+              : 'Default';
+            const optionSignature = buildOptionSignature(variantOptions);
             
             return {
               product_id: productId,
               option_name: optionName,
               option_value: optionValue,
+              variant_options: optionNames.length > 0 ? variantOptions : null,
+              option_signature: optionSignature || null,
               cj_sku: v.cj_sku || null,
               store_sku: v.sku || null,
               cj_variant_id: v.cj_variant_id || null,

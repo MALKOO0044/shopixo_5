@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
-import { getAccessToken, freightCalculate, fetchProductDetailsBatch, findCheapestConfiguredShippingOption, getInventoryByPid, queryVariantInventory } from '@/lib/cj/v2';
+import { getAccessToken, freightCalculate, fetchProductDetailsBatch, findCheapestConfiguredShippingOption, getInventoryByPid, queryVariantInventory, getProductVariants, fetchProductDetailsByPid } from '@/lib/cj/v2';
 import { ensureAdmin } from '@/lib/auth/admin-guard';
 import { fetchJson } from '@/lib/http';
 import { loggerForRequest } from '@/lib/log';
@@ -12,6 +12,12 @@ import { dedupeLabelsCaseInsensitive, extractCanonicalSize, normalizeCjProductId
 import { extractCjProductGalleryImages, normalizeCjImageKey, prioritizeCjHeroImage } from '@/lib/cj/image-gallery';
 import { extractCjProductVideoCandidates, inferCjVideoQualityHint } from '@/lib/cj/video';
 import { build4kVideoDelivery } from '@/lib/video/delivery';
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  extractVariantOptionsFromRawVariant,
+} from '@/lib/variants/dynamic-options';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -55,6 +61,8 @@ type PricedVariant = {
   variantImage?: string;
   size?: string;
   color?: string;
+  variantOptions?: Record<string, string>;
+  optionSignature?: string;
   allShippingOptions?: ShippingOption[];
 };
 
@@ -145,6 +153,12 @@ type PricedProduct = {
   videoDeliveryMode?: 'native' | 'enhanced' | 'passthrough';
   videoQualityGatePassed?: boolean;
   videoSourceQualityHint?: '4k' | 'hd' | 'sd' | 'unknown';
+  availableOptions?: Array<{
+    name: string;
+    values: string[];
+    inStockValues: string[];
+    source?: string;
+  }>;
   availableSizes?: string[];
   availableColors?: string[];
   availableModels?: string[];
@@ -449,19 +463,9 @@ async function enrichWithListV2Inventory(
 }
 
 async function getVariantsForProduct(token: string, base: string, pid: string): Promise<any[]> {
+  // Delegate to shared cached helper; keep logging semantics
   try {
-    const res = await fetchJson<any>(`${base}/product/variant/query?pid=${encodeURIComponent(pid)}`, {
-      headers: {
-        'CJ-Access-Token': token,
-        'Content-Type': 'application/json',
-      },
-      cache: 'no-store',
-      timeoutMs: 15000,
-    });
-    const data = res?.data;
-    const variants = Array.isArray(data) ? data : (data?.list || data?.variants || []);
-    
-    // Log first variant to see what fields are available
+    const variants = await getProductVariants(pid);
     if (variants.length > 0) {
       const sample = variants[0];
       const keys = Object.keys(sample);
@@ -469,22 +473,17 @@ async function getVariantsForProduct(token: string, base: string, pid: string): 
       console.log(`[Variants] Product ${pid}: ${variants.length} variants`);
       console.log(`[Variants] ALL fields: [${keys.join(', ')}]`);
       console.log(`[Variants] Image fields: [${imageKeys.join(', ')}]`);
-      
-      // Log actual values for image fields
       for (const k of imageKeys) {
-        const val = sample[k];
+        const val = (sample as any)[k];
         if (val) {
           console.log(`[Variants] ${k} = ${typeof val === 'string' ? val.slice(0, 100) : JSON.stringify(val).slice(0, 100)}`);
         }
       }
-      
-      // Log shipping-critical fields: vid is needed for "According to Shipping Method" freight calculation
       console.log(`[Variants] vid = ${sample.vid || 'NOT_FOUND'}`);
       console.log(`[Variants] variantSku = ${sample.variantSku || 'NOT_FOUND'}`);
-      if (sample.variantKey) console.log(`[Variants] variantKey = ${sample.variantKey}`);
-      if (sample.variantNameEn) console.log(`[Variants] variantNameEn = ${sample.variantNameEn}`);
+      if ((sample as any).variantKey) console.log(`[Variants] variantKey = ${(sample as any).variantKey}`);
+      if ((sample as any).variantNameEn) console.log(`[Variants] variantNameEn = ${(sample as any).variantNameEn}`);
     }
-    
     return variants;
   } catch (e: any) {
     console.log(`[Variants] Error for ${pid}:`, e?.message);
@@ -641,7 +640,7 @@ async function handleSearch(req: Request, isPost: boolean) {
       r.headers.set('x-request-id', log.requestId);
       return r;
     }
-
+    
     const { searchParams } = new URL(req.url);
     
     // For POST requests, parse body to get seenPids (can be large)
@@ -667,6 +666,9 @@ async function handleSearch(req: Request, isPost: boolean) {
     const shippingMethod = searchParams.get('shippingMethod') || 'any';
     const sizesParam = searchParams.get('sizes') || '';
     const mediaMode = parseDiscoverMediaMode(searchParams.get('mediaMode'));
+    const modeParam = (searchParams.get('mode') || '').toLowerCase();
+    const smartDiscoverEnabled = (process.env.SMART_DISCOVER || '') === '1';
+    const fastMode = smartDiscoverEnabled && (modeParam === 'fast' || modeParam === 'lite' || modeParam === '1');
     
     // Batching parameters for Vercel timeout handling
     // batchSize: max products to fully process per request (default 3 for safe margin)
@@ -970,10 +972,120 @@ async function handleSearch(req: Request, isPost: boolean) {
       return r;
     }
     
+    const targetProducts = isBatchMode ? remainingNeeded : quantity;
+
+    // Fast mode: return LiteProduct[] without per-product details/variants/inventory/freight
+    // Gated by SMART_DISCOVER and explicit mode param; preserves response envelope
+    if (fastMode) {
+      const liteProducts: PricedProduct[] = [];
+      for (const item of candidateProducts) {
+        if (liteProducts.length >= targetProducts) break;
+        const pid = String(item.pid || item.productId || '');
+        if (!pid) continue;
+        const cjSku = String(item.productSku || item.sku || `CJ-${pid}`);
+        const name = String(item.productNameEn || item.name || item.productName || '');
+        let images = extractAllImages(item);
+        if ((!images || images.length === 0) && typeof item.bigImage === 'string') images = [item.bigImage];
+        if ((!images || images.length === 0) && typeof item.whiteImage === 'string') images = [item.whiteImage];
+        const videoDiag = extractBestVideo(item);
+        const videoDelivery = build4kVideoDelivery(videoDiag.videoUrl);
+        const videoUrl = videoDelivery.deliveryUrl || undefined;
+        const listedNum = Number(item.listedNum || 0);
+        const stockApprox = Number(item.warehouseInventoryNum || item.totalVerifiedInventory || 0);
+        const priceUsd = Number(item.sellPrice || item.price || 0);
+        const minPriceUSD = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : undefined;
+        const maxPriceUSD = minPriceUSD;
+        const minPriceSAR = minPriceUSD ? usdToSar(minPriceUSD) : 0;
+        const maxPriceSAR = maxPriceUSD ? usdToSar(maxPriceUSD) : 0;
+        const avgPriceSAR = (minPriceSAR && maxPriceSAR)
+          ? (minPriceSAR + maxPriceSAR) / 2
+          : (minPriceSAR || maxPriceSAR || 0);
+        const displayedRating = Number(item.rating || item.avgRating || item.score || 0) || undefined;
+        const reviewCount = Number(item.reviewCount || item.commentCount || 0) || undefined;
+
+        liteProducts.push({
+          pid,
+          cjSku,
+          name,
+          images: Array.isArray(images) ? images : [],
+          minPriceSAR,
+          maxPriceSAR,
+          avgPriceSAR,
+          minPriceUSD,
+          maxPriceUSD,
+          stock: Number.isFinite(stockApprox) ? stockApprox : 0,
+          listedNum,
+          inventory: undefined,
+          inventoryStatus: undefined,
+          inventoryErrorMessage: undefined,
+          variants: [],
+          inventoryVariants: undefined,
+          successfulVariants: 0,
+          totalVariants: 0,
+          description: undefined,
+          overview: undefined,
+          productInfo: undefined,
+          sizeInfo: undefined,
+          productNote: undefined,
+          packingList: undefined,
+          displayedRating,
+          ratingConfidence: undefined,
+          rating: displayedRating,
+          reviewCount,
+          supplierName: undefined,
+          itemAsDescribed: undefined,
+          serviceRating: undefined,
+          shippingSpeedRating: undefined,
+          categoryName: String(item.categoryName || item.threeCategoryName || item.twoCategoryName || item.category || ''),
+          productWeight: undefined,
+          packLength: undefined,
+          packWidth: undefined,
+          packHeight: undefined,
+          material: undefined,
+          productType: undefined,
+          sizeChartImages: undefined,
+          processingTimeHours: undefined,
+          deliveryTimeHours: undefined,
+          estimatedProcessingDays: undefined,
+          estimatedDeliveryDays: undefined,
+          originCountry: undefined,
+          hsCode: undefined,
+          videoUrl,
+          videoSourceUrl: undefined,
+          video4kUrl: undefined,
+          videoDeliveryMode: videoUrl ? videoDelivery.mode : undefined,
+          videoQualityGatePassed: videoUrl ? videoDelivery.qualityGatePassed : undefined,
+          videoSourceQualityHint: videoUrl ? videoDelivery.sourceQualityHint : undefined,
+          availableSizes: undefined,
+          availableColors: undefined,
+          availableModels: undefined,
+          colorImageMap: undefined,
+        });
+      }
+
+      const r = NextResponse.json({
+        ok: true,
+        products: liteProducts,
+        count: liteProducts.length,
+        mediaMode,
+        duration: Date.now() - startTime,
+        batch: isBatchMode ? {
+          hasMore: !exhaustedAllPages && (candidateProducts.length > liteProducts.length),
+          cursor: `${currentCatIdx}.${currentPage}.${currentItemOffset}`,
+          attemptedPids: attemptedPidsThisBatch,
+          processedPids: liteProducts.map((p) => p.pid),
+          totalCandidates: candidateProducts.length,
+          productsThisBatch: liteProducts.length,
+          batchSize,
+        } : undefined,
+      }, { headers: { 'Cache-Control': 'no-store' } });
+      r.headers.set('x-request-id', log.requestId);
+      return r;
+    }
+
     // Process candidates until we reach the needed quantity
     // In batch mode: use remainingNeeded (what client still needs)
     // In non-batch mode: use quantity (full request)
-    const targetProducts = isBatchMode ? remainingNeeded : quantity;
     console.log(`[Search&Price] Processing candidates to get ${targetProducts} products (batch mode: ${isBatchMode})...`);
     console.log(`[Search&Price] Available candidates: ${candidateProducts.length}`);
     
@@ -2215,6 +2327,8 @@ async function handleSearch(req: Request, isPost: boolean) {
         // Single variant product - try to get exact shipping using product-level vid
         const sellPrice = Number(item.sellPrice || item.price || 0);
         const costSAR = usdToSar(sellPrice);
+        const singleVariantOptions = extractVariantOptionsFromRawVariant(item);
+        const singleVariantSignature = buildOptionSignature(singleVariantOptions);
         
         // For single-variant products, use pid or product-level vid
         const variantVid = String(item.vid || item.variants?.[0]?.vid || pid || '');
@@ -2333,6 +2447,8 @@ async function handleSearch(req: Request, isPost: boolean) {
             stock: variantStock?.totalStock,
             cjStock: variantStock?.cjStock,
             factoryStock: variantStock?.factoryStock,
+            variantOptions: Object.keys(singleVariantOptions).length > 0 ? singleVariantOptions : undefined,
+            optionSignature: singleVariantSignature || undefined,
           });
         }
         
@@ -2490,6 +2606,14 @@ async function handleSearch(req: Request, isPost: boolean) {
             const costSAR = usdToSar(variantPriceUSD);
             const variantName = String(variant.variantNameEn || variant.variantName || '').replace(/[\u4e00-\u9fff]/g, '').trim() || undefined;
             const { size, color } = extractVariantColorSize(variant, variantName);
+            const variantOptions = extractVariantOptionsFromRawVariant(variant);
+            if (color && !Object.keys(variantOptions).some((name) => /color|colour/i.test(name))) {
+              variantOptions.Color = color;
+            }
+            if (size && !Object.keys(variantOptions).some((name) => /size/i.test(name))) {
+              variantOptions.Size = size;
+            }
+            const optionSignature = buildOptionSignature(variantOptions);
             const variantImage = resolveColorImageFromMap(
               color,
               colorImageMap,
@@ -2538,6 +2662,8 @@ async function handleSearch(req: Request, isPost: boolean) {
               stock: variantStock?.totalStock,
               cjStock: variantStock?.cjStock,
               factoryStock: variantStock?.factoryStock,
+              variantOptions: Object.keys(variantOptions).length > 0 ? variantOptions : undefined,
+              optionSignature: optionSignature || undefined,
             });
           }
 
@@ -2661,6 +2787,22 @@ async function handleSearch(req: Request, isPost: boolean) {
       // Extract origin country and HS code
       const originCountry = String(source.originCountry || source.countryOrigin || source.originArea || '').trim() || undefined;
       const hsCode = source.entryCode ? `${source.entryCode}${source.entryNameEn ? ` (${source.entryNameEn})` : ''}` : undefined;
+
+      const availableOptions = deriveAvailableOptionsFromVariants(
+        pricedVariants.map((variant) => ({
+          variantOptions: variant.variantOptions,
+          stock: variant.stock,
+          cjStock: variant.cjStock,
+          factoryStock: variant.factoryStock,
+          color: variant.color,
+          size: variant.size,
+        })),
+        { includeOutOfStockDimensions: false }
+      );
+      const legacyFromDynamicOptions = deriveLegacyOptionArrays(availableOptions);
+      const resolvedAvailableSizes = legacyFromDynamicOptions.availableSizes;
+      const resolvedAvailableColors = legacyFromDynamicOptions.availableColors;
+      const resolvedAvailableModels = legacyFromDynamicOptions.availableModels;
       
       pricedProducts.push({
         pid,
@@ -2728,9 +2870,10 @@ async function handleSearch(req: Request, isPost: boolean) {
         videoDeliveryMode: videoDelivery.mode,
         videoQualityGatePassed: videoDelivery.qualityGatePassed,
         videoSourceQualityHint: videoDelivery.sourceQualityHint,
-        availableSizes: extractedSizes,
-        availableColors: extractedColors,
-        availableModels: extractedModels,
+        availableOptions: availableOptions.length > 0 ? availableOptions : undefined,
+        availableSizes: resolvedAvailableSizes.length > 0 ? resolvedAvailableSizes : undefined,
+        availableColors: resolvedAvailableColors.length > 0 ? resolvedAvailableColors : undefined,
+        availableModels: resolvedAvailableModels.length > 0 ? resolvedAvailableModels : undefined,
         // Color-to-image mapping for color swatches
         colorImageMap: Object.keys(colorImageMap).length > 0 ? colorImageMap : undefined,
       });

@@ -3,6 +3,8 @@ export type ProductVariant = {
   product_id: number;
   option_name: string; // e.g., "Size"
   option_value: string; // e.g., S | M | L | XL | XXL | XXXL
+  variant_options?: Record<string, string> | null;
+  option_signature?: string | null;
   cj_sku: string | null;
   cj_variant_id?: string | null;
   price: number | null; // if null, fallback to product.price
@@ -77,6 +79,12 @@ export type Product = {
   shipping_from?: string | null;
 
   // Optional merchandising metadata
+  available_options?: Array<{
+    name: string;
+    values: string[];
+    inStockValues: string[];
+    source?: string;
+  }> | null;
   available_colors?: string[] | null;
   available_sizes?: string[] | null;
   color_image_map?: Record<string, string> | null;

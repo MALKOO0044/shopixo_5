@@ -6,6 +6,12 @@ import { normalizeCjVideoUrl } from '@/lib/cj/video';
 import { normalizeCjImageKey } from '@/lib/cj/image-gallery';
 import { normalizeSizeList } from '@/lib/cj/size-normalization';
 import { enhanceProductImageUrl } from '@/lib/media/image-quality';
+import {
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  parseDynamicAvailableOptions,
+  type DynamicAvailableOption,
+} from '@/lib/variants/dynamic-options';
 
 let supabaseAdmin: SupabaseClient | null = null;
 
@@ -117,6 +123,7 @@ export async function checkProductQueueSchema(): Promise<{
     { name: 'size_info', type: 'TEXT', default: 'NULL' },
     { name: 'product_note', type: 'TEXT', default: 'NULL' },
     { name: 'packing_list', type: 'TEXT', default: 'NULL' },
+    { name: 'available_options', type: 'JSONB', default: 'NULL' },
     { name: 'available_colors', type: 'JSONB', default: 'NULL' },
     { name: 'available_sizes', type: 'JSONB', default: 'NULL' },
     { name: 'available_models', type: 'JSONB', default: 'NULL' },
@@ -264,6 +271,7 @@ export async function addProductToQueue(batchId: number, product: {
   originCountry?: string;
   hsCode?: string;
   sizeChartImages?: string[];
+  availableOptions?: DynamicAvailableOption[];
   availableSizes?: string[];
   availableColors?: string[];
   availableModels?: string[];
@@ -320,11 +328,23 @@ export async function addProductToQueue(batchId: number, product: {
 
   const productCode = await generateUniqueProductCode(admin);
   const storeSku = product.storeSku || productCode;
+  const normalizedAvailableOptions = (() => {
+    const fromProduct = parseDynamicAvailableOptions(product.availableOptions);
+    if (fromProduct.length > 0) return fromProduct;
+    return deriveAvailableOptionsFromVariants(
+      Array.isArray(product.variants) ? product.variants : [],
+      { includeOutOfStockDimensions: false }
+    );
+  })();
+  const legacyFromDynamicOptions = deriveLegacyOptionArrays(normalizedAvailableOptions);
   const normalizedAvailableSizes = Array.isArray(product.availableSizes)
     ? normalizeSizeList(product.availableSizes, { allowNumeric: false })
-    : [];
+    : legacyFromDynamicOptions.availableSizes;
   const availableColorMap = new Map<string, string>();
-  for (const color of Array.isArray(product.availableColors) ? product.availableColors : []) {
+  const sourceColors = Array.isArray(product.availableColors)
+    ? product.availableColors
+    : legacyFromDynamicOptions.availableColors;
+  for (const color of sourceColors) {
     const rawColor = typeof color === 'string' ? color.trim() : '';
     if (!rawColor) continue;
     const colorKey = rawColor.toLowerCase().replace(/\s+/g, ' ');
@@ -333,6 +353,9 @@ export async function addProductToQueue(batchId: number, product: {
     }
   }
   const deduplicatedAvailableColors = Array.from(availableColorMap.values());
+  const deduplicatedAvailableModels = Array.isArray(product.availableModels)
+    ? product.availableModels
+    : legacyFromDynamicOptions.availableModels;
 
   const normalizedQueueImages: string[] = [];
   const seenImageKeys = new Set<string>();
@@ -449,9 +472,10 @@ export async function addProductToQueue(batchId: number, product: {
     hs_code: product.hsCode || null,
     category_name: product.categoryName || null,
     size_chart_images: product.sizeChartImages || null,
+    available_options: normalizedAvailableOptions.length > 0 ? normalizedAvailableOptions : null,
     available_sizes: normalizedAvailableSizes.length > 0 ? normalizedAvailableSizes : null,
     available_colors: deduplicatedAvailableColors.length > 0 ? deduplicatedAvailableColors : null,
-    available_models: product.availableModels || null,
+    available_models: deduplicatedAvailableModels.length > 0 ? deduplicatedAvailableModels : null,
     cj_category_id: product.cjCategoryId || null,
     supabase_category_id: product.supabaseCategoryId || null,
     supabase_category_slug: product.supabaseCategorySlug || null,

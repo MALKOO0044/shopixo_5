@@ -6,6 +6,13 @@ import { extractCjProductGalleryImages } from '@/lib/cj/image-gallery';
 import { extractCjProductVideoUrl } from '@/lib/cj/video';
 import { normalizeSingleSize } from '@/lib/cj/size-normalization';
 import { build4kVideoDelivery } from '@/lib/video/delivery';
+import {
+  buildOptionSignature,
+  deriveAvailableOptionsFromVariants,
+  deriveLegacyOptionArrays,
+  extractVariantOptionsFromRawVariant,
+  type DynamicAvailableOption,
+} from '@/lib/variants/dynamic-options';
 
 // CJ v2 client with token auth per official docs:
 // - POST /authentication/getAccessToken { apiKey }
@@ -18,6 +25,7 @@ import { build4kVideoDelivery } from '@/lib/video/delivery';
 // ============================================================================
 import { Ratelimit } from '@upstash/ratelimit';
 import { Redis } from '@upstash/redis';
+import { getCache, setCache } from '@/lib/cache/cj-cache';
 
 // In-memory fallback for single-process rate limiting
 let lastCjRequestTime = 0;
@@ -288,6 +296,14 @@ export async function freightCalculate(params: CjFreightCalcParams): Promise<Fre
   
   console.log(`[CJ Freight] Getting "According to Shipping Method" for vid=${vid}, qty=${qty}, ${startCountry} → ${endCountry}`);
   
+  const cacheKeyFreight = `cj:freight:vid:${vid}:dst:${endCountry}:qty:${qty}:start:${startCountry}`;
+  try {
+    const cached = await getCache<FreightResult>(cacheKeyFreight);
+    if (cached) {
+      return cached;
+    }
+  } catch {}
+  
   try {
     // Use CJ's freightCalculate API - this returns the exact "According to Shipping Method" data
     const body = {
@@ -306,22 +322,27 @@ export async function freightCalculate(params: CjFreightCalcParams): Promise<Fre
     const result = parseFreightResponse(r);
     if (result.ok && result.options.length > 0) {
       console.log(`[CJ Freight] Got ${result.options.length} shipping options from CJ "According to Shipping Method"`);
+      try { await setCache(cacheKeyFreight, result, 21600); } catch {}
       return result;
     }
     
     // No options returned
-    return {
+    const miss: FreightResult = {
       ok: false,
       reason: 'no_options',
       message: 'CJ returned no shipping options for this variant/destination',
     };
+    try { await setCache(cacheKeyFreight, miss, 900); } catch {}
+    return miss;
   } catch (e: any) {
     console.error(`[CJ Freight] API error: ${e?.message}`);
-    return {
+    const err: FreightResult = {
       ok: false,
       reason: 'api_error',
       message: `CJ shipping API error: ${e?.message || 'Unknown error'}`,
     };
+    try { await setCache(cacheKeyFreight, err, 300); } catch {}
+    return err;
   }
 }
 
@@ -413,6 +434,13 @@ export function findCJPacketOrdinary(options: CjShippingOption[]): CjShippingOpt
 export async function getProductVariants(pid: string): Promise<any[]> {
   const token = await getAccessToken();
   const base = await resolveBase();
+  const cacheKeyVariants = `cj:variants:pid:${pid}`;
+  try {
+    const cached = await getCache<any[]>(cacheKeyVariants);
+    if (cached && Array.isArray(cached)) {
+      return cached;
+    }
+  } catch {}
   
   try {
     const res = await fetchJson<any>(`${base}/product/variant/query?pid=${encodeURIComponent(pid)}`, {
@@ -430,6 +458,7 @@ export async function getProductVariants(pid: string): Promise<any[]> {
       console.log(`[CJ Variants] Product ${pid}: ${variants.length} variants found`);
     }
     
+    try { await setCache(cacheKeyVariants, variants, 43200); } catch {}
     return variants;
   } catch (e: any) {
     console.log(`[CJ Variants] Error for ${pid}:`, e?.message);
@@ -460,6 +489,14 @@ export type CjProductInventory = {
 export async function getInventoryByPid(pid: string): Promise<CjProductInventory | null> {
   const token = await getAccessToken();
   const base = await resolveBase();
+  
+  const cacheKeyInventory = `cj:inventory:pid:${pid}`;
+  try {
+    const cached = await getCache<CjProductInventory>(cacheKeyInventory);
+    if (cached) {
+      return cached;
+    }
+  } catch {}
   
   console.log(`[CJ Inventory] Fetching inventory for pid=${pid}`);
   
@@ -518,6 +555,7 @@ export async function getInventoryByPid(pid: string): Promise<CjProductInventory
     
     console.log(`[CJ Inventory] Parsed for ${pid}: total=${result.totalAvailable} (CJ=${totalCJ}, Factory=${totalFactory}), warehouses=${warehouses.length}`);
     
+    try { await setCache(cacheKeyInventory, result, 43200); } catch {}
     return result;
   } catch (e: any) {
     console.error(`[CJ Inventory] Error fetching inventory for ${pid}:`, e?.message);
@@ -549,6 +587,14 @@ export type CjVariantInventory = {
 export async function queryVariantInventory(pid: string, warehouse?: string): Promise<CjVariantInventory[]> {
   const token = await getAccessToken();
   const base = await resolveBase();
+  
+  const cacheKeyVarInv = `cj:variantInventory:pid:${pid}:wh:${warehouse || '-'}`;
+  try {
+    const cached = await getCache<CjVariantInventory[]>(cacheKeyVarInv);
+    if (cached && Array.isArray(cached)) {
+      return cached;
+    }
+  } catch {}
   
   const toSafeNumber = (val: any, fallback = 0): number => {
     if (val === undefined || val === null || val === '') return fallback;
@@ -1018,6 +1064,7 @@ export async function queryVariantInventory(pid: string, warehouse?: string): Pr
   }
   
   console.log(`[CJ Variants] Final result: ${allVariants.length} variants for ${pid}`);
+  try { await setCache(cacheKeyVarInv, allVariants, 43200); } catch {}
   return allVariants;
 }
 
@@ -1038,6 +1085,8 @@ export type CjVariantLike = {
   widthCm?: number;
   heightCm?: number;
   imageUrl?: string; // optional variant image if provided by CJ
+  variantOptions?: Record<string, string>;
+  optionSignature?: string;
 };
 
 export type CjProductLike = {
@@ -1065,8 +1114,10 @@ export type CjProductLike = {
   weight?: string | null; // Product weight (may be range like "98.00-120.00")
   materialEn?: string[] | null; // Material names in English
   packingEn?: string[] | null; // Packing names in English
+  availableOptions?: DynamicAvailableOption[] | null; // Dynamic options from supplier variants
   availableColors?: string[] | null; // Unique colors across variants
   availableSizes?: string[] | null; // Unique sizes across variants
+  availableModels?: string[] | null; // Legacy compatibility field
 };
 
 let baseOverride: string | null = null;
@@ -1678,6 +1729,11 @@ function mergeListV2Fields(productData: any, match: any, source: string): void {
 // Fetch full product details by PID - returns complete product with all images and variants
 export async function fetchProductDetailsByPid(pid: string): Promise<any | null> {
   if (!pid) return null;
+  const cacheKeyDetails = `cj:details:pid:${pid}`;
+  try {
+    const cached = await getCache<any>(cacheKeyDetails);
+    if (cached) return cached;
+  } catch {}
   
   try {
     // Fetch product details from /product/query
@@ -1932,16 +1988,14 @@ export async function fetchProductDetailsByPid(pid: string): Promise<any | null>
     
     // Fetch variants separately to get complete variant data with images
     try {
-      const vr = await cjFetch<any>(`/product/variant/query?pid=${encodeURIComponent(pid)}`);
-      const variantList = Array.isArray(vr?.data) ? vr.data : (vr?.data?.list || []);
-      if (variantList.length > 0) {
+      const variantList = await getProductVariants(pid);
+      if (Array.isArray(variantList) && variantList.length > 0) {
         console.log(`[CJ Details] Product ${pid} has ${variantList.length} variants`);
         productData = { ...productData, variantList };
       }
-    } catch {
-      // Continue without variants if that endpoint fails
-    }
+    } catch {}
     
+    try { await setCache(cacheKeyDetails, productData, 43200); } catch {}
     return productData;
   } catch (e: any) {
     console.log(`[CJ Details] Failed to fetch details for ${pid}:`, e?.message);
@@ -2257,6 +2311,21 @@ export function mapCjItemToProductLike(item: any): CjProductLike | null {
       if (finalSize) {
         finalSize = normalizeSingleSize(finalSize, { allowNumeric: true }) || finalSize;
       }
+
+      const variantOptions = extractVariantOptionsFromRawVariant(v);
+      if (finalColor) {
+        const hasColor = Object.keys(variantOptions).some((name) => /color|colour/i.test(name));
+        if (!hasColor) {
+          variantOptions.Color = String(finalColor).trim();
+        }
+      }
+      if (finalSize) {
+        const hasSize = Object.keys(variantOptions).some((name) => /size/i.test(name));
+        if (!hasSize) {
+          variantOptions.Size = String(finalSize).trim();
+        }
+      }
+      const optionSignature = buildOptionSignature(variantOptions);
       
       // Extract CJ and Factory stock separately
       const cjStock = pickNum(v.cjStock, v.cjInventory, v.cjAvailableNum);
@@ -2281,6 +2350,8 @@ export function mapCjItemToProductLike(item: any): CjProductLike | null {
         widthCm: typeof widthCm === 'number' ? widthCm : undefined,
         heightCm: typeof heightCm === 'number' ? heightCm : undefined,
         imageUrl: (typeof variantImage === 'string' ? variantImage : undefined) as string | undefined,
+        variantOptions,
+        optionSignature: optionSignature || undefined,
       });
 
     }
@@ -2405,15 +2476,13 @@ export function mapCjItemToProductLike(item: any): CjProductLike | null {
   const materialEn = parseSafeArray(item.materialNameEnSet || item.materialNameEn) ?? null;
   const packingEn = parseSafeArray(item.packingNameEnSet || item.packingNameEn) ?? null;
 
-  // Collect unique colors and sizes from variants
-  const colorSet = new Set<string>();
-  const sizeSet = new Set<string>();
-  for (const v of variants) {
-    if (v.color) colorSet.add(v.color);
-    if (v.size) sizeSet.add(v.size);
-  }
-  const availableColors = colorSet.size > 0 ? Array.from(colorSet) : null;
-  const availableSizes = sizeSet.size > 0 ? Array.from(sizeSet) : null;
+  const availableOptions = deriveAvailableOptionsFromVariants(variants, {
+    includeOutOfStockDimensions: false,
+  });
+  const legacy = deriveLegacyOptionArrays(availableOptions);
+  const availableColors = legacy.availableColors.length > 0 ? legacy.availableColors : null;
+  const availableSizes = legacy.availableSizes.length > 0 ? legacy.availableSizes : null;
+  const availableModels = legacy.availableModels.length > 0 ? legacy.availableModels : null;
 
   return {
     productId,
@@ -2440,7 +2509,9 @@ export function mapCjItemToProductLike(item: any): CjProductLike | null {
     weight,
     materialEn,
     packingEn,
+    availableOptions,
     availableColors,
     availableSizes,
+    availableModels,
   };
 }

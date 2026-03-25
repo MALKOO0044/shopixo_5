@@ -1,2 +1,0 @@
-SKU,Name,Category,Supplier,CostUSD,WeightKg,DimLxWxHcm,ShipMethod,ShipCostUSD,PaymentFeePct,PaymentFeeFixedUSD,FXBufferPct,ReturnsReservePct,PackagingUSD,DutiesTaxesUSD,LandedUSD,TargetMarginPct,RecommendedPriceUSD,RecommendedPriceSAR,MarketPriceSAR,Notes
-EX-12345,Basic Tee,Womens,Wioo,15,0.35,30x22x3,Economy,6.8,3,0.1,1,5,0.2,0, ,30, , ,"LandedUSD = CostUSD + ShipCostUSD + PackagingUSD + DutiesTaxesUSD + (PaymentFeePct% of RecommendedPrice) + PaymentFeeFixedUSD + (FXBufferPct% of Landed) + (ReturnsReservePct% of Landed). Fill after shipping matrix is known."

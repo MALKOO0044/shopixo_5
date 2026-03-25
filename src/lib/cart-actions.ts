@@ -6,6 +6,11 @@ import { cookies } from "next/headers";
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import type { CartItem, Product } from "./types";
+import {
+  buildOptionSignature,
+  normalizeOptionNameKey,
+  parseDynamicVariantOptions,
+} from "./variants/dynamic-options";
 
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -187,6 +192,59 @@ function buildVariantName(options: { name: string; value: string }[]): string | 
   
   // Join values with hyphen
   return sorted.map(o => o.value).join('-');
+}
+
+function buildSelectedOptionMap(options: { name: string; value: string }[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const option of options) {
+    const name = String(option.name || "").trim();
+    const value = String(option.value || "").trim();
+    if (!name || !value) continue;
+    map[name] = value;
+  }
+  return map;
+}
+
+function extractVariantOptionMapFromRow(row: any): Record<string, string> {
+  const parsed = parseDynamicVariantOptions(row?.variant_options);
+  if (Object.keys(parsed).length > 0) return parsed;
+
+  const optionName = String(row?.option_name || "").trim();
+  const optionValue = String(row?.option_value || "").trim();
+  if (optionName && optionValue) {
+    return { [optionName]: optionValue };
+  }
+
+  return {};
+}
+
+function findOptionValueByKey(options: Record<string, string>, optionKey: string): string {
+  for (const [name, value] of Object.entries(options || {})) {
+    if (normalizeOptionNameKey(name) === optionKey) {
+      return String(value || "").trim();
+    }
+  }
+  return "";
+}
+
+function optionsMatchByNormalizedNameAndValue(
+  left: Record<string, string>,
+  right: Record<string, string>
+): boolean {
+  const leftEntries = Object.entries(left || {}).filter(([name, value]) => String(name).trim() && String(value).trim());
+  const rightEntries = Object.entries(right || {}).filter(([name, value]) => String(name).trim() && String(value).trim());
+  if (leftEntries.length !== rightEntries.length) return false;
+
+  for (const [name, rawValue] of leftEntries) {
+    const key = normalizeOptionNameKey(name);
+    const leftValue = String(rawValue || "").trim().toLowerCase();
+    const rightValue = findOptionValueByKey(right, key).toLowerCase();
+    if (!rightValue || rightValue !== leftValue) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 async function getOrCreateCart() {
@@ -550,6 +608,8 @@ export async function addItem(prevState: any, formData: FormData) {
   let { productId, quantity, productSlug } = validatedFields.data;
   const selected = parseSelectedOption(formData); // e.g., { name: "Size", value: "L" }
   const allOptions = parseAllSelectedOptions(formData); // All options: Color, Size, etc.
+  const selectedOptionMap = buildSelectedOptionMap(allOptions);
+  const selectedOptionSignature = buildOptionSignature(selectedOptionMap);
   const variantName = buildVariantName(allOptions); // e.g., "Star blue-XL"
   
   // Extract color and size separately for robust display
@@ -576,34 +636,70 @@ export async function addItem(prevState: any, formData: FormData) {
 
     console.log(`[addItem] Product ${productId}, options: ${JSON.stringify(allOptions)}, variantName: "${variantName}"`);
 
-    // Try resolve variant_id if option provided
+    // Try resolve variant_id with dynamic signature first, then legacy option-name/value fallback
     let variantRow: any = null;
-    if (selected) {
-      const { data: vrow } = await supabaseAdmin
+    if (selectedOptionSignature) {
+      const { data: bySignature } = await supabaseAdmin
+        .from("product_variants")
+        .select("*")
+        .eq("product_id", productId)
+        .eq("option_signature", selectedOptionSignature)
+        .maybeSingle();
+      variantRow = bySignature ?? null;
+
+      if (!variantRow) {
+        const { data: variantsForProduct } = await supabaseAdmin
+          .from("product_variants")
+          .select("*")
+          .eq("product_id", productId);
+
+        const list = Array.isArray(variantsForProduct) ? variantsForProduct : [];
+        variantRow =
+          list.find((row) => {
+            const map = extractVariantOptionMapFromRow(row);
+            if (Object.keys(map).length === 0) return false;
+            if (optionsMatchByNormalizedNameAndValue(map, selectedOptionMap)) return true;
+            const rowSignature = buildOptionSignature(map);
+            return rowSignature.length > 0 && rowSignature === selectedOptionSignature;
+          }) || null;
+      }
+    }
+
+    if (!variantRow && selected) {
+      const { data: legacyRow } = await supabaseAdmin
         .from("product_variants")
         .select("*")
         .eq("product_id", productId)
         .eq("option_name", selected.name)
         .eq("option_value", selected.value)
         .maybeSingle();
-      variantRow = vrow ?? null;
+      variantRow = legacyRow ?? null;
     }
 
     const cart = await getOrCreateCart();
+
+    // Detect which columns exist in cart_items table
+    const cols = await detectCartItemsColumns(supabaseAdmin);
 
     // Check if item already exists in cart
     // Find existing item by product_id AND variant_name (so different variants are separate cart items)
     let existingItem: any = null;
     
     // Build query to find matching cart item
+    const selectCols = cols.hasVariantId
+      ? "id, quantity, variant_name, variant_id"
+      : "id, quantity, variant_name";
     let query = supabaseAdmin
       .from("cart_items")
-      .select("id, quantity, variant_name")
+      .select(selectCols)
       .eq("session_id", cart.id)
       .eq("product_id", productId);
     
-    // Match by variant_name if provided
-    if (variantName) {
+    // Prefer exact variant_id match when available
+    if (cols.hasVariantId && variantRow?.id) {
+      query = query.eq("variant_id", variantRow.id);
+    } else if (variantName) {
+      // Match by variant_name if provided
       query = query.eq("variant_name", variantName);
     } else {
       query = query.is("variant_name", null);
@@ -614,9 +710,6 @@ export async function addItem(prevState: any, formData: FormData) {
     if (!findError && existingItems && existingItems.length > 0) {
       existingItem = existingItems[0];
     }
-
-    // Detect which columns exist in cart_items table
-    const cols = await detectCartItemsColumns(supabaseAdmin);
 
     if (existingItem) {
       // Update quantity for matching variant

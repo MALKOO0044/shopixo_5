@@ -5,6 +5,15 @@ export type ShippingOption = {
   deliveryDays: string;
 };
 
+export type DynamicVariantOptions = Record<string, string>;
+
+export type DynamicAvailableOption = {
+  name: string;
+  values: string[];
+  inStockValues: string[];
+  source?: string;
+};
+
 export type PricedVariant = {
   variantId: string;
   variantSku: string;
@@ -29,6 +38,8 @@ export type PricedVariant = {
   variantImage?: string;
   size?: string;
   color?: string;
+  variantOptions?: DynamicVariantOptions;
+  optionSignature?: string;
   allShippingOptions?: ShippingOption[];
 };
 
@@ -114,6 +125,7 @@ export type PricedProduct = {
   videoDeliveryMode?: 'native' | 'enhanced' | 'passthrough';
   videoQualityGatePassed?: boolean;
   videoSourceQualityHint?: '4k' | 'hd' | 'sd' | 'unknown';
+  availableOptions?: DynamicAvailableOption[];
   availableSizes?: string[];
   availableColors?: string[];
   availableModels?: string[];
